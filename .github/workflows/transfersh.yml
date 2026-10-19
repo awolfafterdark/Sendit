@@ -1,0 +1,223 @@
+name: transfersh
+
+on:
+  push:
+    branches:
+      - main
+
+  schedule:
+    - cron: "0 */5 * * *"
+
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: transfersh
+  cancel-in-progress: false
+
+jobs:
+  transfer:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 345
+
+    env:
+      PUBLIC_URL: https://nondurable-tabetha-cellular.ngrok-free.dev
+      PORT: "8080"
+      RUNTIME_MINUTES: "330"
+
+      # Paste your ngrok token here.
+      NGROK_AUTHTOKEN: "2sSOL9woYm3berKY1lMn8DyDdRa_5KY2F6cRxe2658WbBFDsh"
+
+    steps:
+      - name: Install Go
+        uses: actions/setup-go@v6
+        with:
+          go-version: stable
+
+      - name: Download Transfer.sh
+        run: |
+          git clone --depth 1 \
+            https://github.com/dutchcoders/transfer.sh.git \
+            "$RUNNER_TEMP/transfer.sh"
+
+      - name: Build Transfer.sh
+        run: |
+          set -euo pipefail
+
+          cd "$RUNNER_TEMP/transfer.sh"
+
+          go build -o "$RUNNER_TEMP/transfersh" main.go
+
+          "$RUNNER_TEMP/transfersh" --help
+
+      - name: Install ngrok
+        run: |
+          set -euo pipefail
+
+          curl -fsSL \
+            https://ngrok-agent.s3.amazonaws.com/ngrok.asc \
+            | sudo tee /etc/apt/trusted.gpg.d/ngrok.asc >/dev/null
+
+          echo \
+            "deb https://ngrok-agent.s3.amazonaws.com buster main" \
+            | sudo tee /etc/apt/sources.list.d/ngrok.list
+
+          sudo apt-get update
+          sudo apt-get install -y ngrok
+
+          ngrok version
+
+      - name: Prepare storage
+        run: |
+          mkdir -p "$RUNNER_TEMP/transfer-data"
+          mkdir -p "$RUNNER_TEMP/transfer-temp"
+
+      - name: Start Transfer.sh
+        run: |
+          set -euo pipefail
+
+          "$RUNNER_TEMP/transfersh" \
+            --provider local \
+            --listener "127.0.0.1:${PORT}" \
+            --basedir "$RUNNER_TEMP/transfer-data" \
+            --temp-path "$RUNNER_TEMP/transfer-temp" \
+            >"$RUNNER_TEMP/transfer.log" 2>&1 &
+
+          echo "$!" > "$RUNNER_TEMP/transfer.pid"
+
+          for i in $(seq 1 60); do
+            if curl -s \
+              "http://127.0.0.1:${PORT}/" \
+              >/dev/null; then
+              echo "Transfer.sh started."
+              exit 0
+            fi
+
+            if ! kill -0 \
+              "$(cat "$RUNNER_TEMP/transfer.pid")" \
+              2>/dev/null; then
+              cat "$RUNNER_TEMP/transfer.log"
+              exit 1
+            fi
+
+            sleep 1
+          done
+
+          cat "$RUNNER_TEMP/transfer.log"
+          exit 1
+
+      - name: Start ngrok
+        run: |
+          set -euo pipefail
+
+          ngrok http "$PORT" \
+            --url "$PUBLIC_URL" \
+            --log stdout \
+            >"$RUNNER_TEMP/ngrok.log" 2>&1 &
+
+          echo "$!" > "$RUNNER_TEMP/ngrok.pid"
+
+          for i in $(seq 1 60); do
+            if ! kill -0 \
+              "$(cat "$RUNNER_TEMP/ngrok.pid")" \
+              2>/dev/null; then
+              cat "$RUNNER_TEMP/ngrok.log"
+              exit 1
+            fi
+
+            if curl -fsS \
+              http://127.0.0.1:4040/api/tunnels \
+              | grep -Fq "$PUBLIC_URL"; then
+              echo "ngrok connected."
+              exit 0
+            fi
+
+            sleep 2
+          done
+
+          cat "$RUNNER_TEMP/ngrok.log"
+          exit 1
+
+      - name: Keep server online
+        run: |
+          set -euo pipefail
+
+          END_TIME=$((
+            $(date +%s) + RUNTIME_MINUTES * 60
+          ))
+
+          echo "======================================"
+          echo "TRANSFER.SH ONLINE"
+          echo "======================================"
+          echo "URL: $PUBLIC_URL"
+          echo "Runtime: $RUNTIME_MINUTES minutes"
+          echo "Storage: Local runner filesystem"
+          echo "======================================"
+
+          {
+            echo "## Transfer.sh"
+            echo
+            echo "**Status:** Running"
+            echo
+            echo "**Public URL:** $PUBLIC_URL"
+            echo
+            echo "**Software:** Official Transfer.sh"
+            echo
+            echo "**Storage:** Local runner filesystem"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+          while true; do
+            NOW=$(date +%s)
+
+            if (( NOW >= END_TIME )); then
+              echo "Runtime completed."
+              break
+            fi
+
+            for service in transfer ngrok; do
+              PID_FILE="$RUNNER_TEMP/$service.pid"
+
+              if [[ ! -f "$PID_FILE" ]]; then
+                echo "::error::$service PID missing"
+                exit 1
+              fi
+
+              if ! kill -0 \
+                "$(cat "$PID_FILE")" \
+                2>/dev/null; then
+                echo "::error::$service stopped"
+                exit 1
+              fi
+            done
+
+            REMAINING=$((END_TIME - NOW))
+
+            echo "[TRANSFER.SH] Online | ${REMAINING}s remaining"
+
+            sleep 30
+          done
+
+      - name: Stop services
+        if: always()
+        run: |
+          for service in ngrok transfer; do
+            PID_FILE="$RUNNER_TEMP/$service.pid"
+
+            if [[ -f "$PID_FILE" ]]; then
+              kill "$(cat "$PID_FILE")" 2>/dev/null || true
+            fi
+          done
+
+      - name: Show logs on failure
+        if: failure()
+        run: |
+          for service in transfer ngrok; do
+            LOG="$RUNNER_TEMP/$service.log"
+
+            if [[ -f "$LOG" ]]; then
+              echo "===== $service ====="
+              tail -100 "$LOG"
+            fi
+          done
