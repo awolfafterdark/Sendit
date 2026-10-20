@@ -1,4 +1,4 @@
-name: Inspect uploaded Archive 2
+name: Check archived model compatibility
 on:
   push:
     branches: ["codex/archive-2-inspection-20261020"]
@@ -20,7 +20,9 @@ jobs:
         with:
           persist-credentials: false
           sparse-checkout: archive-inspection
-      - name: Validate inspector syntax
-        run: python3 -m py_compile archive-inspection/inspect.py
-      - name: Inspect archive without executing its contents
-        run: python3 -u archive-inspection/inspect.py
+      - name: Install Core ML format parser
+        run: |
+          python3 -m venv "$RUNNER_TEMP/coreml-check"
+          "$RUNNER_TEMP/coreml-check/bin/python" -m pip install --disable-pip-version-check coremltools==9.0
+      - name: Check model serialization and interfaces
+        run: '"$RUNNER_TEMP/coreml-check/bin/python" -u archive-inspection/check_models.py'
