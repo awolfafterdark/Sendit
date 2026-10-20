@@ -109,7 +109,7 @@ def inspect_zip(source, label, depth=0):
         if unsafe: emit("UNSAFE_PATHS",unsafe[:30])
         emit("TOP_LEVEL",dict(collections.Counter(x.filename.split("/")[0] for x in files)))
         emit("LARGEST_FILES",[{"path":x.filename,"bytes":x.file_size} for x in sorted(files,key=lambda x:x.file_size,reverse=True)[:20]])
-        emit("INVENTORY",[{"path":x.filename,"bytes":x.file_size} for x in files[:220]])
+        emit("INVENTORY",[{"path":x.filename,"bytes":x.file_size} for x in files if "/algo/" not in x.filename][:100])
         if len(files)>220: emit("INVENTORY_TRUNCATED",len(files)-220)
         known_exec=set()
         for x in files:
@@ -150,6 +150,132 @@ def inspect_zip(source, label, depth=0):
                         emit("TEXT",{"archive":label,"path":x.filename,"text":data[:14000].decode("utf-8","replace"),"truncated":len(data)>14000})
                 except Exception as e: emit("TEXT_ERROR",{"path":x.filename,"error":type(e).__name__})
 
+
+def compact(value, depth=0):
+    if depth > 5:
+        return "[depth limit]"
+    if isinstance(value, bytes):
+        if value.startswith(b"bplist") or value.startswith(b"<?xml"):
+            try: return compact(plistlib.loads(value),depth+1)
+            except Exception: pass
+        try:
+            decoded=value.decode("utf-8")
+            return compact(decoded,depth+1)
+        except Exception:
+            return {"bytes":len(value),"header_hex":value[:16].hex()}
+    if isinstance(value, dict):
+        out={}
+        for k,v in list(value.items())[:60]:
+            if re.search(r"password|token|secret|authorization|receipt|signkey|sign_key",str(k),re.I):
+                out[str(k)]="[value omitted]"
+            else: out[str(k)]=compact(v,depth+1)
+        return out
+    if isinstance(value, (list,tuple)):
+        return [compact(v,depth+1) for v in value[:10]]
+    if isinstance(value,str):
+        if value[:1] in ("{","[") and len(value)<200000:
+            try:return compact(json.loads(value),depth+1)
+            except Exception:pass
+        value=re.sub(r"(https?://[^\s?]+)\?[^\s\"<>]*",r"\1?[query omitted]",value)
+        return value[:900]+(" [truncated]" if len(value)>900 else "")
+    return value
+
+def inspect_storage(path):
+    import sqlite3, tempfile, subprocess, shutil
+    with zipfile.ZipFile(path) as z:
+        files=[x for x in z.infolist() if not x.is_dir() and not x.filename.startswith("__MACOSX/")]
+        emit("CRC_CHECK",{"bad_entry":z.testzip(),"files_checked":len(files)})
+        groups={}
+        roots={}
+        for x in files:
+            parts=x.filename.split("/")
+            root=parts[0]
+            rec=roots.setdefault(root,{"files":0,"bytes":0})
+            rec["files"]+=1
+            rec["bytes"]+=x.file_size
+            category="/".join(parts[:3])
+            g=groups.setdefault(category,{"files":0,"bytes":0})
+            g["files"]+=1
+            g["bytes"]+=x.file_size
+        emit("CONTAINERS",roots)
+        emit("DIRECTORY_TOTALS",groups)
+        maps={}
+        for x in files:
+            root,relative=x.filename.split("/",1)
+            maps.setdefault(root,{})[relative]=x
+        if len(maps)==2:
+            a,b=maps.values()
+            common=sorted(set(a)&set(b))
+            equal=[]
+            different=[]
+            for key in common:
+                da=read_limited(z,a[key],20*1024*1024)
+                db=read_limited(z,b[key],20*1024*1024)
+                if hashlib.sha256(da).digest()==hashlib.sha256(db).digest():equal.append(key)
+                else:different.append(key)
+            emit("CONTAINER_COMPARISON",{"common_files":len(common),"identical":equal,"different":different,
+                 "only_first":[k for k in a if k not in b][:25],"only_second_count":len(set(b)-set(a))})
+        for i,x in enumerate(files):
+            p=pathlib.PurePosixPath(x.filename)
+            if p.suffix.lower()==".db":
+                data=read_limited(z,x,10*1024*1024)
+                if not data.startswith(b"SQLite format 3"):
+                    emit("DATABASE_FORMAT",{"path":x.filename,"header_hex":data[:20].hex()})
+                    continue
+                with tempfile.NamedTemporaryFile(suffix=".db",dir=os.environ["RUNNER_TEMP"]) as f:
+                    f.write(data);f.flush()
+                    con=sqlite3.connect("file:"+f.name+"?mode=ro&immutable=1",uri=True)
+                    try:
+                        con.execute("PRAGMA trusted_schema=OFF")
+                        tables=con.execute("SELECT name, sql FROM sqlite_master WHERE type='table'").fetchall()
+                        emit("DATABASE",{"path":x.filename,"integrity":con.execute("PRAGMA quick_check").fetchone()[0],
+                             "tables":[{"name":a,"schema":b} for a,b in tables]})
+                        for table,_ in tables[:30]:
+                            q='"'+table.replace('"','""')+'"'
+                            count=con.execute("SELECT count(*) FROM "+q).fetchone()[0]
+                            cur=con.execute("SELECT * FROM "+q+" LIMIT 5")
+                            cols=[d[0] for d in cur.description]
+                            rows=[compact(dict(zip(cols,row))) for row in cur.fetchall()]
+                            emit("TABLE_SAMPLE",{"path":x.filename,"table":table,"count":count,"rows":rows})
+                    finally:con.close()
+            elif p.suffix.lower() in (".json",".prj",".archive",".archiver") and x.file_size<=1024*1024:
+                data=read_limited(z,x,1024*1024)
+                obj=None
+                typ="unknown"
+                try:obj=plistlib.loads(data);typ="plist"
+                except Exception:
+                    try:obj=json.loads(data);typ="json"
+                    except Exception:pass
+                emit("STRUCTURED_FILE",{"path":x.filename,"format":typ,
+                     "value":compact(obj) if obj is not None else {"header_hex":data[:32].hex(),"ascii_samples":[compact(v.decode()) for v in re.findall(rb"[\x20-\x7e]{6,}",data)[:12]]}})
+            elif p.suffix.lower()==".mmap":
+                data=read_limited(z,x,1024*1024)
+                strings=[v.decode() for v in re.findall(rb"[\x20-\x7e]{5,}",data)]
+                domains=sorted(set(re.findall(r"https?://([A-Za-z0-9.-]+)", "\n".join(strings))))
+                hints=[s for s in strings if re.search(r"bundle|version|com\.|purchase|vip|member|premium|document|container|app.?name",s,re.I)]
+                emit("MMAP",{"path":x.filename,"header_hex":data[:32].hex(),"domains":domains,"relevant_strings":[compact(s) for s in hints[:55]],"printable_string_count":len(strings)})
+            elif p.name=="off_sign_key":
+                data=read_limited(z,x,1024*1024)
+                emit("PRIVATE_FILE",{"path":x.filename,"bytes":len(data),"sha256":hashlib.sha256(data).hexdigest(),"format_hint":"binary plist" if data.startswith(b"bplist") else "other"})
+            elif p.suffix.lower()==".mp4" and "/public/export/" in x.filename:
+                probe=shutil.which("ffprobe")
+                if not probe:
+                    emit("VIDEO",{"path":x.filename,"bytes":x.file_size,"probe":"ffprobe unavailable"})
+                    continue
+                with tempfile.NamedTemporaryFile(suffix=".mp4",dir=os.environ["RUNNER_TEMP"]) as f:
+                    with z.open(x) as src:shutil.copyfileobj(src,f)
+                    f.flush()
+                    run=subprocess.run([probe,"-v","error","-show_entries","format=duration,size:stream=codec_name,codec_type,width,height,r_frame_rate,duration","-of","json",f.name],capture_output=True,text=True,timeout=45)
+                    try:obj=json.loads(run.stdout)
+                    except Exception:obj={"error":run.stderr[:500]}
+                    emit("VIDEO",{"path":x.filename,"metadata":obj})
+        samples=[x for x in files if "/algo/" in x.filename][:3]
+        for x in samples:
+            data=read_limited(z,x,1024*1024)
+            try:obj=json.loads(data)
+            except Exception:obj={"header_hex":data[:32].hex(),"ascii_samples":[s.decode()[:100] for s in re.findall(rb"[\x20-\x7e]{5,}",data)[:8]]}
+            emit("ALGORITHM_CACHE_SAMPLE",{"path":x.filename,"value":compact(obj)})
+
 def main():
     cfg=json.loads(pathlib.Path("archive-inspection/source.json").read_text())
     url=cfg["download_url"]
@@ -176,6 +302,7 @@ def main():
         return 1
     try:
         inspect_zip(path,cfg["file_name"])
+        inspect_storage(path)
         emit("INSPECTION_COMPLETE",{"bytes_read":TOTAL_READ,"nested_archives":NESTED_COUNT,"binary_files":BINARY_COUNT,"text_files":TEXT_COUNT})
     except Exception as e:
         emit("ERROR",{"error":type(e).__name__,"message":str(e)[:500]})
