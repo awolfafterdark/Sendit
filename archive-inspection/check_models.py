@@ -33,11 +33,14 @@ with zipfile.ZipFile(path) as z:
         hints=[s for s in strings if re.search(r"coreml|protobuf|input|output|conv|batchnorm|weight|onnx|pytorch|tensorflow|mlmodel|model|image|float|neural",s,re.I)]
         rec["format_strings"]=hints[:35]
         rec["printable_strings"]=len(strings)
+        rec["header_first_integer"]=int.from_bytes(data[:4],"little")
+        rec["header_text"]=data[4:100].split(b"\0")[0].decode("ascii","replace")
+        rec["payload_samples"]={str(off):data[off:off+32].hex() for off in (256,512,1024,1280,1456,1536,2048)}
         with tempfile.NamedTemporaryFile(suffix=".xymodel") as f:
             f.write(data);f.flush()
             rec["file_command"]=subprocess.run(["file","-b",f.name],capture_output=True,text=True,check=False).stdout.strip()
         parsed=False
-        for off in (0,4,8,12,16,24,32,64,128,256):
+        for off in dict.fromkeys((0,4,8,12,16,24,32,64,128,256,512,1024,1280,1456,1460,1536,2048,int.from_bytes(data[:4],"little"))):
             spec=Model_pb2.Model()
             try:
                 spec.ParseFromString(data[off:])
