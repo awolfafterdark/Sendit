@@ -25,4 +25,4 @@ jobs:
           python3 -m venv "$RUNNER_TEMP/coreml-check"
           "$RUNNER_TEMP/coreml-check/bin/python" -m pip install --disable-pip-version-check coremltools==9.0
       - name: Check model serialization and interfaces
-        run: '"$RUNNER_TEMP/coreml-check/bin/python" -u archive-inspection/check_models.py'
+        run: '"$RUNNER_TEMP/coreml-check/bin/python" -I -u archive-inspection/check_models.py'
