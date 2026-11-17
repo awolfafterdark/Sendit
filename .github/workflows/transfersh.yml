@@ -28,7 +28,7 @@ jobs:
       RUNTIME_MINUTES: "330"
 
       # Paste your ngrok token here.
-      NGROK_AUTHTOKEN: "2sSOL9woYm3berKY1lMn8DyDdRa_5KY2F6cRxe2658WbBFDsh"
+      NGROK_AUTHTOKEN: $YOU_THOUGHT
 
     steps:
       - name: Install Go
